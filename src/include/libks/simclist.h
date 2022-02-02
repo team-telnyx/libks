@@ -42,15 +42,26 @@ extern "C" {
 
 
 	/* Be friend of both C90 and C99 compilers */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
-	/* "inline" and "restrict" are keywords */
+#if __STDC_VERSION__ >= 199901L
+  /* "inline" is a keyword */
 #else
-#ifndef inline
-#   define inline           /* inline */
+# define INLINE
 #endif
-#ifndef restrict
-#   define restrict         /* restrict */
+
+#ifndef INLINE
+# if __GNUC__ && !__GNUC_STDC_INLINE__
+#  define INLINE static inline
+# else
+#  define INLINE inline
+# endif
 #endif
+
+#if defined(__GNUC__) && ((__GNUC__ > 3) || (__GNUC__ == 3 && __GNUC_MINOR__ >= 1))
+# define restrict __restrict
+#elif defined(_MSC_VER) && _MSC_VER >= 1400
+# define restrict __restrict
+#else
+# define restrict
 #endif
 
 
