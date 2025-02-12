@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 SignalWire, Inc
+ * Copyright (c) 2018-2023 SignalWire, Inc
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -194,7 +194,7 @@ KS_DECLARE(ks_size_t) ks_buffer_packet_count(ks_buffer_t *buffer)
 
 	e = (head + buffer->used);
 
-	for (p = head; p && *p && p < e; p++) {
+	for (p = head; p && p < e && *p; p++) {
 		if (*p == '\n') {
 			pe = p + 1;
 			if (*pe == '\r')
@@ -219,7 +219,7 @@ KS_DECLARE(ks_size_t) ks_buffer_read_packet(ks_buffer_t *buffer, void *data, ks_
 
 	e = (head + buffer->used);
 
-	for (p = head; p && *p && p < e; p++) {
+	for (p = head; p && p < e && *p; p++) {
 		if (*p == '\n') {
 			pe = p + 1;
 			if (*pe == '\r')

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2021 SignalWire, Inc
+ * Copyright (c) 2018-2023 SignalWire, Inc
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,8 @@
 #pragma warning(disable: 4706)
 #endif
 
-#define WS_BLOCK 1
+#define WS_BLOCK 10000	/* ms, blocks read operation for 10 seconds */
+#define WS_SOFT_BLOCK 1000 /* ms, blocks read operation for 1 second */
 #define WS_NOBLOCK 0
 
 #define WS_INIT_SANITY 5000
@@ -36,7 +37,6 @@
 
 #define SHA1_HASH_SIZE 20
 
-ks_ssize_t kws_global_payload_size_max = 0;
 static const char c64[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 //static ks_ssize_t ws_send_buf(kws_t *kws, kws_opcode_t oc);
@@ -71,6 +71,7 @@ struct kws_s {
 	char cipher_name[128];
 	kws_flag_t flags;
 	int x;
+	int ssl_io_error;
 	void *write_buffer;
 	ks_size_t write_buffer_len;
 	char *req_uri;
@@ -84,6 +85,7 @@ struct kws_s {
 	char *unprocessed_position;
 
 	kws_init_callback_t init_callback;
+	ks_json_t *params;
 
 	ks_ssize_t payload_size_max;
 };
@@ -213,27 +215,55 @@ static int ws_client_handshake(kws_t *kws)
 {
 	unsigned char nonce[16] = { 0 };
 	unsigned char enonce[128] = { 0 };
-	char req[2048] = { 0 };
+	char *req = NULL;
 	char *frame_end = NULL;
+	char *extra_headers = NULL;
 
 	gen_nonce(nonce, sizeof(nonce));
 	b64encode(nonce, sizeof(nonce), enonce, sizeof(enonce));
 
-	ks_snprintf(req, sizeof(req),
-				"GET %s HTTP/1.1\r\n"
+	if (kws->params) {
+		ks_json_t *headers = ks_json_get_object_item(kws->params, "headers");
+
+		if (headers) {
+			ks_json_t *param;
+
+			KS_JSON_ARRAY_FOREACH(param, headers) {
+				const char *k = ks_json_get_object_string(param, "key", NULL);
+				const char *v = ks_json_get_object_string(param, "value", NULL);
+
+				if (k && v) {
+					if (extra_headers) {
+						char *tmp = extra_headers;
+						extra_headers = ks_mprintf("%s%s: %s\r\n", tmp, k, v);
+						ks_safe_free(tmp);
+					} else {
+						extra_headers = ks_mprintf("%s: %s\r\n", k, v);
+					}
+				}
+			}
+		}
+	}
+
+	req = ks_mprintf("GET %s HTTP/1.1\r\n"
 				"Host: %s\r\n"
 				"Upgrade: websocket\r\n"
 				"Connection: Upgrade\r\n"
 				"Sec-WebSocket-Key: %s\r\n"
 				"Sec-WebSocket-Version: 13\r\n"
-				"%s%s%s"
+				"%s%s%s%s"
 				"\r\n",
 				kws->req_uri, kws->req_host, enonce,
 				kws->req_proto ? "Sec-WebSocket-Protocol: " : "",
 				kws->req_proto ? kws->req_proto : "",
-				kws->req_proto ? "\r\n" : "");
+				kws->req_proto ? "\r\n" : "",
+				extra_headers ? extra_headers : "");
+
+	if (extra_headers) free(extra_headers);
 
 	kws_raw_write(kws, req, strlen(req));
+
+	ks_safe_free(req);
 
 	ks_ssize_t bytes;
 
@@ -369,12 +399,14 @@ static int ws_server_handshake(kws_t *kws)
 
 }
 
+#define SSL_IO_ERROR(err) (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL)
 #define SSL_ERROR_WANT_READ_WRITE(err) (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
 
 KS_DECLARE(ks_ssize_t) kws_raw_read(kws_t *kws, void *data, ks_size_t bytes, int block)
 {
 	int r;
 	int ssl_err = 0;
+	int block_n = block / 10;
 
 	if (kws->unprocessed_buffer_len > 0) {
 		if (kws->unprocessed_buffer_len > bytes) {
@@ -396,11 +428,15 @@ KS_DECLARE(ks_ssize_t) kws_raw_read(kws_t *kws, void *data, ks_size_t bytes, int
 
 	if (kws->ssl) {
 		do {
+			ERR_clear_error();
 			r = SSL_read(kws->ssl, data, (int)bytes);
 			if (r == 0) {
 				ssl_err = SSL_get_error(kws->ssl, r);
 				if (ssl_err != SSL_ERROR_ZERO_RETURN) {
 					ks_log(KS_LOG_WARNING, "Weird SSL_read error: %d\n", ssl_err);
+					if (SSL_IO_ERROR(ssl_err)) {
+						kws->ssl_io_error = 1;
+					}
 				}
 			}
 
@@ -415,12 +451,16 @@ KS_DECLARE(ks_ssize_t) kws_raw_read(kws_t *kws, void *data, ks_size_t bytes, int
 					kws->x++;
 					ks_sleep_ms(10);
 				} else {
+					if (SSL_IO_ERROR(ssl_err)) {
+						kws->ssl_io_error = 1;
+					}
+
 					r = -1;
 					goto end;
 				}
 			}
 
-		} while (r < 0 && SSL_ERROR_WANT_READ_WRITE(ssl_err) && kws->x < 1000);
+		} while (r < 0 && SSL_ERROR_WANT_READ_WRITE(ssl_err) && kws->x < block_n);
 
 		goto end;
 	}
@@ -439,11 +479,11 @@ KS_DECLARE(ks_ssize_t) kws_raw_read(kws_t *kws, void *data, ks_size_t bytes, int
 				ks_sleep_ms(10);
 			}
 		}
-	} while (r == -1 && ks_errno_is_blocking(ks_errno()) && kws->x < 1000);
+	} while (r == -1 && ks_errno_is_blocking(ks_errno()) && kws->x < block_n);
 
  end:
 
-	if (kws->x >= 10000 || (block && kws->x >= 1000)) {
+	if (kws->x >= 10000 || (block && kws->x >= block_n)) {
 		r = -1;
 	}
 
@@ -522,9 +562,15 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 
 	if (kws->ssl) {
 		do {
+			ERR_clear_error();
 			r = SSL_write(kws->ssl, (void *)((unsigned char *)data + wrote), (int)(bytes - wrote));
 
 			if (r == 0) {
+				ssl_err = SSL_get_error(kws->ssl, r);
+				if (SSL_IO_ERROR(ssl_err)) {
+					kws->ssl_io_error = 1;
+				}
+
 				ssl_err = 42;
 				break;
 			}
@@ -543,6 +589,7 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 						ms = 25;
 					}
 				}
+
 				ks_sleep_ms(ms);
 			}
 
@@ -550,8 +597,13 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 				ssl_err = SSL_get_error(kws->ssl, r);
 
 				if (!SSL_ERROR_WANT_READ_WRITE(ssl_err)) {
+					if (SSL_IO_ERROR(ssl_err)) {
+						kws->ssl_io_error = 1;
+					}
+
 					break;
 				}
+
 				ssl_err = 0;
 			}
 
@@ -563,7 +615,7 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 			r = ssl_err * -1;
 		}
 
-		return r;
+		return r > 0 ? wrote : r;
 	}
 
 	do {
@@ -598,7 +650,7 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 		//printf("wRITE FAIL: %s\n", strerror(errno));
 	//}
 
-	return r;
+	return r >= 0 ? wrote : r;
 }
 
 static void setup_socket(ks_socket_t sock)
@@ -606,6 +658,12 @@ static void setup_socket(ks_socket_t sock)
 	ks_socket_option(sock, KS_SO_NONBLOCK, KS_TRUE);
 	ks_socket_option(sock, TCP_NODELAY, KS_TRUE);
 	ks_socket_option(sock, SO_KEEPALIVE, KS_TRUE);
+#ifdef KS_KEEP_IDLE_INTVL
+#ifndef __APPLE__
+	ks_socket_option(sock, TCP_KEEPIDLE, 30);
+	ks_socket_option(sock, TCP_KEEPINTVL, 30);
+#endif
+#endif /* KS_KEEP_IDLE_INTVL */
 }
 
 static void restore_socket(ks_socket_t sock)
@@ -635,14 +693,22 @@ static int establish_client_logical_layer(kws_t *kws)
 
 		if (!kws->ssl) {
 			kws->ssl = SSL_new(kws->ssl_ctx);
-			assert(kws->ssl);
+			if (!kws->ssl) {
+				unsigned long ssl_new_error = ERR_peek_error();
+				ks_log(KS_LOG_ERROR, "Failed to initiate SSL with error [%lu]\n", ssl_new_error);
+				return -1;
+			}
 
 			SSL_set_fd(kws->ssl, (int)kws->sock);
 
 			if (kws->init_callback) kws->init_callback(kws, kws->ssl);
 		}
 
+		/* Provide the server name, allowing SNI to work. */
+		SSL_set_tlsext_host_name(kws->ssl, kws->req_host);
+
 		do {
+			ERR_clear_error();
 			code = SSL_connect(kws->ssl);
 
 			if (code == 1) {
@@ -733,12 +799,17 @@ static int establish_server_logical_layer(kws_t *kws)
 
 		if (!kws->ssl) {
 			kws->ssl = SSL_new(kws->ssl_ctx);
-			assert(kws->ssl);
+			if (!kws->ssl) {
+				unsigned long ssl_new_error = ERR_peek_error();
+				ks_log(KS_LOG_ERROR, "Failed to initiate SSL with error [%lu]\n", ssl_new_error);
+				return -1;
+			}
 
 			SSL_set_fd(kws->ssl, (int)kws->sock);
 		}
 
 		do {
+			ERR_clear_error();
 			code = SSL_accept(kws->ssl);
 
 			if (code == 1) {
@@ -810,20 +881,21 @@ static int establish_logical_layer(kws_t *kws)
 	}
 }
 
-KS_DECLARE(ks_status_t) kws_init(kws_t **kwsP, ks_socket_t sock, SSL_CTX *ssl_ctx, const char *client_data, kws_flag_t flags, ks_pool_t *pool)
+KS_DECLARE(ks_status_t) kws_init_ex(kws_t **kwsP, ks_socket_t sock, SSL_CTX *ssl_ctx, const char *client_data, kws_flag_t flags, ks_pool_t *pool, ks_json_t *params)
 {
 	kws_t *kws;
 
 	if (*kwsP) kws = *kwsP;
 	else kws = ks_pool_alloc(pool, sizeof(*kws));
 
-	kws->payload_size_max = kws_global_payload_size_max;
 	kws->flags = flags;
 	kws->unprocessed_buffer_len = 0;
 	kws->unprocessed_position = NULL;
+	kws->params = ks_json_duplicate(params, KS_TRUE);
+	kws->payload_size_max = ks_json_get_object_number_int(params, "payload_size_max", 0);
 
 	if ((flags & KWS_BLOCK)) {
-		kws->block = 1;
+		kws->block = WS_BLOCK;
 	}
 
 	if (client_data) {
@@ -967,6 +1039,7 @@ KS_DECLARE(void) kws_destroy(kws_t **kwsP)
 	if (kws->bbuffer) ks_pool_free(&kws->bbuffer);
 
 	kws->buffer = kws->bbuffer = NULL;
+	if (kws->params) ks_json_delete(&kws->params);
 
 	ks_pool_free(&kws);
 	kws = NULL;
@@ -986,26 +1059,109 @@ KS_DECLARE(ks_ssize_t) kws_close(kws_t *kws, int16_t reason)
 		kws->uri = NULL;
 	}
 
-	if (reason && kws->sock != KS_SOCK_INVALID) {
+	if (kws->handshake && kws->sock != KS_SOCK_INVALID) {
 		uint16_t *u16;
-		uint8_t fr[4] = {WSOC_CLOSE | 0x80, 2, 0};
+		int16_t got_reason = reason ? reason : WS_NORMAL_CLOSE /* regular close initiated by us */;
 
-		u16 = (uint16_t *) &fr[2];
-		*u16 = htons((int16_t)reason);
-		kws_raw_write(kws, fr, 4);
+		if (kws->type == KWS_CLIENT) {
+			const uint8_t maskb = 0x80;
+			uint8_t size = 0x02, fr[8] = {WSOC_CLOSE | 0x80, size | maskb, 0, 0, 0, 0, 0, 0}, masking_key[4], i;
+			uint8_t *p;
+
+			u16 = (uint16_t *) &fr[6];
+			*u16 = htons((int16_t)got_reason); 
+			p = (uint8_t *)u16; /*use p for masking the reason which is the payload */
+
+			gen_nonce(masking_key, 4);
+			memcpy((uint8_t *)fr + 2, &masking_key, 4);
+
+			for (i = 0; i < size; i++) {
+				*(p + i) = (*((uint8_t *)p + i)) ^ (*(masking_key + (i % 4)));
+			}
+
+			kws_raw_write(kws, fr, 8);
+		} else {
+			uint8_t fr[4] = {WSOC_CLOSE | 0x80, 2, 0};
+
+			u16 = (uint16_t *) &fr[2];
+			*u16 = htons((int16_t)got_reason);
+			kws_raw_write(kws, fr, 4);
+		}
 	}
 
 	if (kws->ssl && kws->sock != KS_SOCK_INVALID) {
-		/* first invocation of SSL_shutdown() would normally return 0 and just try to send SSL protocol close request.
+		/* first invocation of SSL_shutdown() would normally return 0 and just try to send SSL protocol close request (close_notify_alert).
 		   we just slightly polite, since we want to close socket fast and
 		   not bother waiting for SSL protocol close response before closing socket,
 		   since we want cleanup to be done fast for scenarios like:
 		   client change NAT (like jump from one WiFi to another) and now unreachable from old ip:port, however
 		   immidiately reconnect with new ip:port but old session id (and thus should replace the old session/channel)
+		   However it is recommended to do bidirectional shutdown
+		   and also to read all the remaining data sent by the client
+		   before it indicates EOF (SSL_ERROR_ZERO_RETURN).
+		   To avoid stuck in this process in case of dead peers,
+		   we wait for WS_SOFT_BLOCK time (1s) before we give up.
 		*/
-		SSL_shutdown(kws->ssl);
+		int code = 0, rcode = 0;
+		int ssl_error = 0;
+		int n = 0, block_n = WS_SOFT_BLOCK / 10;
+
+		/* SSL layer was never established or underlying IO error occured */
+		if (!kws->secure_established || kws->ssl_io_error) {
+			goto end;
+		}
+
+		/* connection has been already closed */
+		if (SSL_get_shutdown(kws->ssl) & SSL_SENT_SHUTDOWN) {
+			goto end;
+		}
+
+		/* peer closes the connection */
+		if (SSL_get_shutdown(kws->ssl) & SSL_RECEIVED_SHUTDOWN) {
+			ERR_clear_error();
+			SSL_shutdown(kws->ssl);
+			goto end;
+		}
+
+		/* us closes the connection. We do bidirection shutdown handshake */
+		for(;;) {
+			ERR_clear_error();
+			code = SSL_shutdown(kws->ssl);
+			ssl_error = SSL_get_error(kws->ssl, code);
+			if (code <= 0 && ssl_error == SSL_ERROR_WANT_READ) {
+				/* need to make sure there are no more data to read */
+				for(;;) {
+					ERR_clear_error();
+					if ((rcode = SSL_read(kws->ssl, kws->buffer, 9)) <= 0) {
+						ssl_error = SSL_get_error(kws->ssl, rcode);
+						if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+							break;
+						} else if (SSL_IO_ERROR(ssl_error)) {
+							goto end;
+						} else if (ssl_error == SSL_ERROR_WANT_READ) {
+							if (++n == block_n) {
+								goto end;
+							}
+
+							ks_sleep_ms(10);
+						} else {
+							goto end;
+						}
+					}
+				}
+			} else if (code == 0 || (code < 0 && ssl_error == SSL_ERROR_WANT_WRITE)) {
+				if (++n == block_n) {
+					goto end;
+				}
+
+				ks_sleep_ms(10);
+			} else { /* code != 0 */
+				goto end;
+			}
+		}
 	}
 
+ end:
 	/* restore to blocking here, so any further read/writes will block */
 	restore_socket(kws->sock);
 
@@ -1179,7 +1335,8 @@ KS_DECLARE(ks_ssize_t) kws_read_frame(kws_t *kws, kws_opcode_t *oc, uint8_t **da
 	switch(*oc) {
 	case WSOC_CLOSE:
 		{
-			ks_log(KS_LOG_ERROR, "Read frame error because OPCODE = WSOC_CLOSE\n");
+			/* Nominal case, debug output only */
+			ks_log(KS_LOG_DEBUG, "Read frame OPCODE = WSOC_CLOSE\n");
 			kws->plen = kws->buffer[1] & 0x7f;
 			*data = (uint8_t *) &kws->buffer[2];
 			return kws_close(kws, WS_RECV_CLOSE);
@@ -1271,18 +1428,17 @@ KS_DECLARE(ks_ssize_t) kws_read_frame(kws_t *kws, kws_opcode_t *oc, uint8_t **da
 				return kws_close(kws, WS_NONE);
 			}
 
+			/* size already written to the body */
 			blen = (int)(kws->body - kws->bbuffer);
 
-			// The bbuffer for the body of the message should always be 1 larger than plen from the payload size for null term
-			if (need + blen > (ks_ssize_t)kws->bbuflen || kws->plen >= (ks_ssize_t)kws->bbuflen) {
+			/* The bbuffer for the body of the message should always be 1 larger than the total size (for null term) */
+			if (blen + kws->plen >= (ks_ssize_t)kws->bbuflen) {
 				void *tmp;
 
-				kws->bbuflen = need + blen + kws->rplen;
+				/* must be a sum of the size already written to the body (blen) plus the size to be written (kws->plen) */
+				kws->bbuflen = blen + kws->plen; /* total size */
 
-				if (kws->bbuflen < kws->plen) {
-					kws->bbuflen = kws->plen;
-				}
-
+				/* and 1 more for NULL term */
 				kws->bbuflen++;
 
 				if (kws->payload_size_max && kws->bbuflen > kws->payload_size_max) {
@@ -1293,7 +1449,7 @@ KS_DECLARE(ks_ssize_t) kws_read_frame(kws_t *kws, kws_opcode_t *oc, uint8_t **da
 				}
 
 				// make room for entire payload plus null terminator
-				if ((tmp = ks_pool_resize(kws->bbuffer, kws->bbuflen))) {
+				if ((tmp = ks_pool_resize(kws->bbuffer, (unsigned long)kws->bbuflen))) {
 					kws->bbuffer = tmp;
 				} else {
 					abort();
@@ -1309,8 +1465,9 @@ KS_DECLARE(ks_ssize_t) kws_read_frame(kws_t *kws, kws_opcode_t *oc, uint8_t **da
 				memcpy(kws->body, kws->payload, kws->rplen);
 			}
 
+			ks_assert((kws->body + kws->plen) <= (kws->bbuffer + kws->bbuflen));
+
 			while(need) {
-				ks_assert((kws->body + need + kws->rplen) <= (kws->bbuffer + kws->bbuflen));
 				ks_ssize_t r = kws_string_read(kws, kws->body + kws->rplen, need + 1, WS_BLOCK);
 
 				if (r < 1) {
@@ -1328,7 +1485,7 @@ KS_DECLARE(ks_ssize_t) kws_read_frame(kws_t *kws, kws_opcode_t *oc, uint8_t **da
 			if (mask && maskp) {
 				ks_ssize_t i;
 
-				for (i = 0; i < kws->datalen; i++) {
+				for (i = 0; i < kws->plen; i++) {
 					kws->body[i] ^= maskp[i % 4];
 				}
 			}
@@ -1465,7 +1622,7 @@ KS_DECLARE(ks_ssize_t) kws_write_frame(kws_t *kws, kws_opcode_t oc, const void *
 
 	raw_ret = kws_raw_write(kws, bp, (hlen + bytes));
 
-	if (raw_ret != (ks_ssize_t) (hlen + bytes)) {
+	if (raw_ret <= 0 || raw_ret != (ks_ssize_t) (hlen + bytes)) {
 		return raw_ret;
 	}
 
@@ -1494,11 +1651,6 @@ KS_DECLARE(const char *) kws_sans_get(kws_t *kws, ks_size_t index)
 	return kws->sans[index];
 }
 
-KS_DECLARE(void) kws_set_global_payload_size_max(ks_ssize_t bytes)
-{
-	kws_global_payload_size_max = bytes;
-}
-
 KS_DECLARE(ks_status_t) kws_connect(kws_t **kwsP, ks_json_t *params, kws_flag_t flags, ks_pool_t *pool)
 {
 	return kws_connect_ex(kwsP, params, flags, pool, NULL, 30000);
@@ -1513,10 +1665,10 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 	ks_port_t port = 443;
 	// char buf[50] = "";
 	struct hostent *he;
-	const char *url = ks_json_get_object_cstr(params, "url");
-	// const char *headers = ks_json_get_object_cstr(params, "headers");
+	const char *url = ks_json_get_object_string(params, "url", NULL);
+	// const char *headers = ks_json_get_object_string(params, "headers", NULL);
 	const char *host = NULL;
-	const char *protocol = ks_json_get_object_cstr(params, "protocol");
+	const char *protocol = ks_json_get_object_string(params, "protocol", NULL);
 	const char *path = NULL;
 	char *p = NULL;
 	const char *client_data = NULL;
@@ -1525,13 +1677,10 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 	if (!url) {
 		ks_json_t *tmp;
 
-		path = ks_json_get_object_cstr(params, "path");
-		host = ks_json_get_object_cstr(params, "host");
+		path = ks_json_get_object_string(params, "path", NULL);
+		host = ks_json_get_object_string(params, "host", NULL);
 		tmp = ks_json_get_object_item(params, "port");
-
-		if (ks_json_type_is_number(tmp) && ks_json_value_number_int(tmp) > 0) {
-			port = (ks_port_t)ks_json_value_number_int(tmp);
-		}
+		ks_json_value_number_int(tmp, (int *)&port);
 	} else {
 		if (!strncmp(url, "wss://", 6)) {
 			if (!ssl_ctx) {
@@ -1540,7 +1689,12 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 #else
 				ssl_ctx = SSL_CTX_new(TLSv1_2_client_method());
 #endif
-				assert(ssl_ctx);
+				if (!ssl_ctx) {
+					unsigned long ssl_ctx_error = ERR_peek_error();
+					ks_log(KS_LOG_ERROR, "Failed to initiate SSL context with ssl error [%lu].\n", ssl_ctx_error);
+					return KS_STATUS_FAIL;
+				}
+
 				destroy_ssl_ctx++;
 			}
 
@@ -1601,7 +1755,7 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 		client_data = ks_psprintf(pool, "%s:%s", path, host);
 	}
 
-	if (kws_init(kwsP, cl_sock, ssl_ctx, client_data, flags, pool) != KS_STATUS_SUCCESS) {
+	if (kws_init_ex(kwsP, cl_sock, ssl_ctx, client_data, flags, pool, params) != KS_STATUS_SUCCESS) {
 		if (destroy_ssl_ctx) SSL_CTX_free(ssl_ctx);
 
 		return KS_STATUS_FAIL;
@@ -1932,8 +2086,12 @@ KS_DECLARE(void) kws_request_reset(kws_request_t *request)
 	for (i = 0; i < KWS_MAX_HEADERS; i++) {
 		if (!request->headers_k[i] || !request->headers_v[i]) break;
 		free((void *)request->headers_k[i]);
+		request->headers_k[i] = NULL;
 		free((void *)request->headers_v[i]);
+		request->headers_v[i] = NULL;
 	}
+
+	request->total_headers = 0;
 }
 
 KS_DECLARE(ks_ssize_t) kws_read_buffer(kws_t *kws, uint8_t **data, ks_size_t bytes, int block)
