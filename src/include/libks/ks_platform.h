@@ -25,6 +25,20 @@
 
 KS_BEGIN_EXTERN_C
 
+#if !defined(KS_PLAT_LIN) && !defined(KS_PLAT_WIN) && !defined(KS_PLAT_MAC)
+#ifdef __linux__
+#define KS_PLAT_LIN
+#else
+#ifdef WIN32
+#define KS_PLAT_WIN
+#else
+#ifdef __APPLE__
+#define KS_PLAT_MAC
+#endif
+#endif
+#endif
+#endif
+
 #if !defined(_XOPEN_SOURCE) && !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__) && !defined(__APPLE__)
 #define _XOPEN_SOURCE 600
 #endif
@@ -170,6 +184,12 @@ KS_BEGIN_EXTERN_C
 	typedef int ks_socket_t;
 	typedef ssize_t ks_ssize_t;
 	typedef int ks_filehandle_t;
+#endif
+
+#if defined(_MSC_VER) && defined(_WIN32)
+#define KS_UNUSED
+#else
+#define KS_UNUSED __attribute__((unused))
 #endif
 
 #ifdef __WINDOWS__
