@@ -79,7 +79,7 @@ static void *test2_thread(ks_thread_t *thread, void *data)
 
 			ks_hash_this(itt, &key, NULL, &val);
 
-			printf("%u ITT %s=%s\n", (int)ks_thread_self_id(), (char *)key, (char *)val);
+			printf("%"KS_PID_FMT" ITT %s=%s\n", ks_thread_self_id(), (char *)key, (char *)val);
 		}
 		ks_sleep(100000);
 	}
@@ -134,7 +134,12 @@ int test2(void)
 	}
 
 	for (i = 0; i < ttl; i++) {
-		ks_thread_destroy(&threads[i]);
+		ks_thread_request_stop(threads[i]);
+	}
+
+	for (i = 0; i < ttl; i++) {
+		ks_thread_join(threads[i]);
+		if (ks_thread_destroy(&threads[i]) != KS_STATUS_SUCCESS) return 0;
 	}
 
 
