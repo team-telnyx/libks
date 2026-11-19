@@ -653,19 +653,6 @@ KS_DECLARE(ks_ssize_t) kws_raw_write(kws_t *kws, void *data, ks_size_t bytes)
 	return r >= 0 ? wrote : r;
 }
 
-static void setup_socket(ks_socket_t sock)
-{
-	ks_socket_option(sock, KS_SO_NONBLOCK, KS_TRUE);
-	ks_socket_option(sock, TCP_NODELAY, KS_TRUE);
-	ks_socket_option(sock, SO_KEEPALIVE, KS_TRUE);
-#ifdef KS_KEEP_IDLE_INTVL
-#ifndef __APPLE__
-	ks_socket_option(sock, TCP_KEEPIDLE, 30);
-	ks_socket_option(sock, TCP_KEEPINTVL, 30);
-#endif
-#endif /* KS_KEEP_IDLE_INTVL */
-}
-
 static void restore_socket(ks_socket_t sock)
 {
 	ks_socket_option(sock, KS_SO_NONBLOCK, KS_FALSE);
@@ -766,6 +753,26 @@ static int establish_client_logical_layer(kws_t *kws)
 	if (kws->ssl) {
 		strncpy(kws->cipher_name, SSL_get_cipher_name(kws->ssl), sizeof(kws->cipher_name) - 1);
 		ks_log(KS_LOG_INFO, "SSL negotiation succeeded, negotiated cipher is: %s\n", kws->cipher_name);
+
+		if (ks_json_get_object_bool(kws->params, "ssl_validate_certificate", KS_FALSE)) {
+			X509 *cert = SSL_get_peer_certificate(kws->ssl);
+
+			if (!cert) {
+				ks_log(KS_LOG_ERROR, "SSL negotiation failed, no certificate\n");
+
+				return -1;
+			}
+
+			if (SSL_get_verify_result(kws->ssl) != X509_V_OK) {
+				ks_log(KS_LOG_ERROR, "SSL negotiation failed, invalid certificate\n");
+				X509_free(cert);
+
+				return -1;
+			}
+
+			X509_free(cert);
+		}
+
 	} else {
 		memset(kws->cipher_name, 0, sizeof(kws->cipher_name));
 	}
@@ -932,7 +939,7 @@ KS_DECLARE(ks_status_t) kws_init_ex(kws_t **kwsP, ks_socket_t sock, SSL_CTX *ssl
 
 	kws->secure = ssl_ctx ? 1 : 0;
 
-	setup_socket(sock);
+	ks_socket_common_setup(sock);
 
 	if (establish_logical_layer(kws) == -1) {
 		ks_log(KS_LOG_ERROR, "Failed to establish logical layer\n");
@@ -978,6 +985,7 @@ KS_DECLARE(ks_status_t) kws_init_ex(kws_t **kwsP, ks_socket_t sock, SSL_CTX *ssl
 
  err:
 	kws_destroy(&kws);
+	*kwsP = NULL;
 
 	return KS_STATUS_FAIL;
 }
@@ -1664,7 +1672,6 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 	const char *ip = "127.0.0.1";
 	ks_port_t port = 443;
 	// char buf[50] = "";
-	struct hostent *he;
 	const char *url = ks_json_get_object_string(params, "url", NULL);
 	// const char *headers = ks_json_get_object_string(params, "headers", NULL);
 	const char *host = NULL;
@@ -1673,6 +1680,7 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 	char *p = NULL;
 	const char *client_data = NULL;
 	int destroy_ssl_ctx = 0;
+	ks_status_t status;
 
 	if (!url) {
 		ks_json_t *tmp;
@@ -1694,6 +1702,8 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 					ks_log(KS_LOG_ERROR, "Failed to initiate SSL context with ssl error [%lu].\n", ssl_ctx_error);
 					return KS_STATUS_FAIL;
 				}
+
+				SSL_CTX_set_default_verify_paths(ssl_ctx);
 
 				destroy_ssl_ctx++;
 			}
@@ -1730,21 +1740,14 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 		}
 	}
 
-	if (!host || !path) return KS_STATUS_FAIL;
+	if (!host || !path) {
+		status = KS_STATUS_FAIL;
+		goto err;
+	}
 
-	he = gethostbyname(host);
-
-	if (!he) {
-		ip = host;
-
-		if (strchr(ip, ':')) {
-			family = AF_INET6;
-		}
-
-		ks_addr_set(&addr, ip, port, family);
-	} else {
-		ks_addr_set_raw(&addr, he->h_addr, port, ((struct sockaddr_in *)he->h_addr)->sin_family);
-		// ip = ks_addr_get_host(&addr1);
+	status = ks_addr_getbyname(host, port, AF_UNSPEC, &addr);
+	if (status != KS_STATUS_SUCCESS) {
+		goto err;
 	}
 
 	cl_sock = ks_socket_connect_ex(SOCK_STREAM, IPPROTO_TCP, &addr, timeout_ms);
@@ -1756,14 +1759,22 @@ KS_DECLARE(ks_status_t) kws_connect_ex(kws_t **kwsP, ks_json_t *params, kws_flag
 	}
 
 	if (kws_init_ex(kwsP, cl_sock, ssl_ctx, client_data, flags, pool, params) != KS_STATUS_SUCCESS) {
-		if (destroy_ssl_ctx) SSL_CTX_free(ssl_ctx);
-
-		return KS_STATUS_FAIL;
+		status = KS_STATUS_FAIL;
+		goto err;
 	}
 
-	(*kwsP)->destroy_ssl_ctx = 1;
+	if (destroy_ssl_ctx) {
+		(*kwsP)->destroy_ssl_ctx = 1;
+	}
 
 	return KS_STATUS_SUCCESS;
+
+err:
+	if (destroy_ssl_ctx) {
+		SSL_CTX_free(ssl_ctx);
+	}
+
+	return status;
 }
 
 KS_DECLARE(int) kws_wait_sock(kws_t *kws, uint32_t ms, ks_poll_t flags)
@@ -1796,10 +1807,11 @@ static ks_status_t clean_uri(char *uri)
 	int argc;
 	char *argv[64];
 	int last, i, len, uri_len = 0;
+	const unsigned int max_segments = sizeof(argv) / sizeof(argv[0]);
 
-	argc = ks_separate_string(uri, '/', argv, sizeof(argv) / sizeof(argv[0]));
+	argc = ks_separate_string(uri, '/', argv, max_segments);
 
-	if (argc == sizeof(argv)) { /* too deep */
+	if ((unsigned int)argc == max_segments) { /* too deep */
 		return KS_STATUS_FAIL;
 	}
 
